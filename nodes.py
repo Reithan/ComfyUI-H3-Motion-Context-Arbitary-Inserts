@@ -33,6 +33,9 @@ import json
 import logging
 import os
 
+import torch
+
+import comfy.nested_tensor
 import comfy.utils
 import folder_paths
 import node_helpers
@@ -47,25 +50,18 @@ from .existing_video_extension import (
     MiniMaxH3ExistingVideoMaskedContext,
     MiniMaxH3GeneratedAVMaskedContext,
     MiniMaxH3StartMaskedContext,
-    MiniMaxH3StartCheckpointMaskedContext,
     MiniMaxH3AssembleExtension,
+    MiniMaxH3AssembleInterior,
+    MiniMaxH3SetAVNoiseMask,
+    MiniMaxH3ClearAVNoiseMask,
+    _require_h3_mask_support,
 )
 from .h3_masked_bridge import MiniMaxH3MaskedAVBridge
 from .h3_song_audio_context import MiniMaxH3SongMaskedAVContext
-from .h3_checkpoint_resume import (
-    MiniMaxH3CheckpointSave,
-    MiniMaxH3CheckpointSavePath,
-    MiniMaxH3CheckpointLoadPath,
-    MiniMaxH3CheckpointTailFrames,
-    MiniMaxH3ResumeCheckpointLatent,
-    MiniMaxH3CheckpointLoad,
-    MiniMaxH3ResumeTailFrames,
-    MiniMaxH3ResumeOrLiveLatent,
-    MiniMaxH3CheckpointTrigger,
-    MiniMaxH3AssembleCheckpoints,
-    MiniMaxH3AssembleExtensionCheckpoints,
-    MiniMaxH3AssembleStarterOrExtensionCheckpoints,
-    MiniMaxH3PreviewCheckpointVideo,
+from .h3_streaming_vhs import (
+    MiniMaxH3StreamLiveExtensionAVToVHS,
+    MiniMaxH3StreamLiveMusicVideoToVHS,
+    MiniMaxH3FinalizeVHSOutput,
 )
 from .h3_auto_crop32 import MiniMaxH3CropTo32, MiniMaxH3StartCanvasSelector
 from .h3_timing import crossfade_plan
@@ -990,6 +986,102 @@ class MiniMaxH3CustomKeyframes:
         return (out,)
 
 
+class MiniMaxH3MusicVideoController:
+    """Single source of truth for the checkpoint-free H3 Music Video workflow."""
+
+    PREVIEW_OFF = "Off"
+    PREVIEW_LAST = "Last Active"
+    PREVIEW_ALL = "All Active"
+    MAX_CLIPS = 20
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "active_clips": ("INT", {
+                    "default": 1, "min": 1, "max": cls.MAX_CLIPS, "step": 1,
+                    "tooltip": "Generate Clip 1 through Clip N. Later clip groups are automatically and visibly bypassed.",
+                }),
+                "previews": ([cls.PREVIEW_OFF, cls.PREVIEW_LAST, cls.PREVIEW_ALL], {
+                    "default": cls.PREVIEW_ALL,
+                    "tooltip": "Off disables all clip previews. Last Active previews only the final enabled clip. All Active previews every enabled clip.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "STRING")
+    RETURN_NAMES = ("active_clips", "preview_mode")
+    FUNCTION = "select"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Workflow controller for the checkpoint-free H3 Music Video example. "
+        "Its frontend companion applies real ComfyUI bypass mode to tagged clip/preview groups; "
+        "the backend active_clips output drives the lazy final streaming path."
+    )
+
+    def select(self, active_clips=1, previews=PREVIEW_ALL):
+        return (
+            max(1, min(self.MAX_CLIPS, int(active_clips))),
+            str(previews),
+        )
+
+
+class MiniMaxH3AVExtensionController:
+    """Single source of truth for the AV Extension example workflow."""
+
+    START_EXISTING = "Existing Video"
+    START_T2V = "T2V"
+    START_I2V = "I2V / Custom Keyframes"
+    PREVIEW_OFF = "Off"
+    PREVIEW_LAST = "Last Active"
+    PREVIEW_ALL = "All Active"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "start": ([cls.START_EXISTING, cls.START_T2V, cls.START_I2V], {
+                    "default": cls.START_EXISTING,
+                    "tooltip": "Existing Video loads/extends a source clip. T2V generates a Ref2VA starter without a keyframe. I2V / Custom Keyframes enables the starter keyframe image at frame 1 (resolved frame index 0).",
+                }),
+                "active_extensions": ("INT", {
+                    "default": 1, "min": 1, "max": 6, "step": 1,
+                    "tooltip": "Generate Extensions 1..N. Later extension groups are automatically and visibly bypassed.",
+                }),
+                "audio_feather_ticks": ("INT", {
+                    "default": 8, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Audio latent-mask half-cosine feather. H3 audio latent rate is 40 Hz; 8 ticks = 0.2 seconds. 0 restores a hard audio mask.",
+                }),
+                "previews": ([cls.PREVIEW_OFF, cls.PREVIEW_LAST, cls.PREVIEW_ALL], {
+                    "default": cls.PREVIEW_ALL,
+                    "tooltip": "Off disables all intermediate VHS previews. Last Active previews only the final enabled extension. All Active previews every enabled extension and the generated starter when applicable.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = ("start_mode", "active_extensions", "audio_feather_ticks", "preview_mode")
+    FUNCTION = "select"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Workflow controller for the H3 AV Extension example. Its frontend companion applies real ComfyUI bypass mode to tagged groups; backend outputs drive lazy routing and the final streaming path."
+    )
+
+    def select(self, start=START_EXISTING, active_extensions=1, audio_feather_ticks=8, previews=PREVIEW_ALL):
+        if str(start) == self.START_T2V:
+            mode = "t2v"
+        elif str(start) == self.START_I2V:
+            mode = "i2v"
+        else:
+            mode = "existing_video"
+        return (
+            mode,
+            max(1, min(6, int(active_extensions))),
+            max(0, int(audio_feather_ticks)),
+            str(previews),
+        )
+
+
 class MiniMaxH3ExtensionStartMode:
     """Single workflow switch for the masked AV extension chain start source."""
 
@@ -1014,7 +1106,7 @@ class MiniMaxH3ExtensionStartMode:
     DESCRIPTION = (
         "One global switch for the masked AV extension workflow. The user-facing "
         "choice is mapped to the internal load_video/generate_starter mode used "
-        "by the H3 context, canvas, and checkpoint assembler nodes."
+        "by the H3 context, canvas, and final-output nodes."
     )
 
     def select(self, mode=START_EXISTING_VIDEO):
@@ -1095,6 +1187,358 @@ class MiniMaxH3OptionalReferenceImage:
     def select(self, enabled=False, image=None):
         return (image if bool(enabled) else None,)
 
+class MiniMaxH3CustomKeyframesMasked:
+    """Write still-image H3 keyframes as hard-preserved latent tokens via noise mask.
+
+    Hard-preserves one latent step per keyframe (up to 4 frames of static hold for
+    interior frames; exactly 1 frame at phase-0 positions). Phase-0 positions are
+    1, 18, 35, 52, ... in the default 1-based mode; 0, 17, 34, 51, ... in 0-based
+    mode. Use the soft keyframe node for suggestions; use this node when the frame
+    must appear verbatim. Audio is not masked and will be fully generated.
+
+    If the decoded output shows still-frame artifacts, encode a 5-frame static run
+    (native, 2 steps) and take step 1 (the 4-frame token) as the contingency path.
+    """
+
+    MAX_KEYFRAMES = 32
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": (
+                    "LATENT",
+                    {
+                        "tooltip": (
+                            "Target MiniMax H3 AV latent; defines resolution "
+                            "and exact frame count."
+                        )
+                    },
+                ),
+                "vae": (
+                    "VAE",
+                    {
+                        "tooltip": (
+                            "MiniMax H3 video VAE used to encode each still."
+                        )
+                    },
+                ),
+                "keyframe_state": (
+                    "STRING",
+                    {
+                        "default": (
+                            '{"count":3,"positions":[1,22,79]}'
+                        ),
+                        "multiline": False,
+                        "tooltip": (
+                            "Internal UI state. Normally managed by the "
+                            "keyframe position controls."
+                        ),
+                    },
+                ),
+                "indexing": (
+                    ["1-based", "0-based"],
+                    {"default": "1-based"},
+                ),
+                "crop": (
+                    ["disabled", "center"],
+                    {"default": "disabled"},
+                ),
+            },
+            "optional": _DynamicKeyframeInputs(),
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "apply"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Hard-preserve still-image keyframes by writing each encoded still directly "
+        "into the target AV latent and masking those steps from denoising. "
+        "Pinned positions must be phase-0 to pin exactly one frame: 1, 18, 35, 52, "
+        "... in the default 1-based mode; 0, 17, 34, 51, ... in 0-based mode. "
+        "Interior positions pin the full containing latent step (up to 4 "
+        "frames of static hold). Existing nested H3 AV masks are preserved and "
+        "merged; a keyframe may not overlap an already protected video step. "
+        "Audio mask state is preserved unchanged."
+    )
+
+    def apply(
+        self,
+        latent,
+        vae,
+        keyframe_state,
+        indexing="1-based",
+        crop="disabled",
+        **kwargs,
+    ):
+        _require_h3_mask_support()
+
+        try:
+            state = json.loads(keyframe_state or "{}")
+        except Exception as exc:
+            raise ValueError(
+                "h3_motion_context: invalid H3 Custom Keyframes UI state"
+            ) from exc
+
+        positions = state.get("positions", [])
+        count = int(state.get("count", len(positions)))
+
+        if count < 1 or count > self.MAX_KEYFRAMES:
+            raise ValueError(
+                "h3_motion_context: Custom Keyframes count must be 1..%d"
+                % self.MAX_KEYFRAMES
+            )
+        if len(positions) < count:
+            raise ValueError(
+                "h3_motion_context: %d keyframe slots but only %d saved "
+                "positions" % (count, len(positions))
+            )
+
+        video = _video_from_latent(latent)
+        latent_t = int(video.shape[2])
+        width = int(video.shape[4]) * 16
+        height = int(video.shape[3]) * 16
+        frame_count = _pixel_frames(latent_t)
+
+        offsets = _step_offsets(latent_t)
+
+        anchors = []
+        for slot in range(1, count + 1):
+            raw_position = int(positions[slot - 1])
+            pixel_index = (
+                raw_position - 1
+                if indexing == "1-based"
+                else raw_position
+            )
+
+            if pixel_index < 0 or pixel_index >= frame_count:
+                low, high = (
+                    (1, frame_count)
+                    if indexing == "1-based"
+                    else (0, frame_count - 1)
+                )
+                raise ValueError(
+                    "h3_motion_context: keyframe %d position %d is "
+                    "outside %d..%d"
+                    % (slot, raw_position, low, high)
+                )
+
+            # Find the latent step containing this pixel frame.
+            step_k = None
+            for k, off in enumerate(offsets):
+                span_k = FRAME_PER_TOKEN[k % 5]
+                if off <= pixel_index < off + span_k:
+                    step_k = k
+                    step_start = off
+                    step_span = span_k
+                    break
+
+            if step_k is None:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d pixel index %d could not "
+                    "be mapped to a latent step" % (slot, pixel_index)
+                )
+
+            if step_span > 1:
+                phase0_lower = (pixel_index // 17) * 17
+                phase0_upper = phase0_lower + 17
+                disp_lower = (
+                    phase0_lower + 1 if indexing == "1-based" else phase0_lower
+                )
+                disp_upper = (
+                    phase0_upper + 1 if indexing == "1-based" else phase0_upper
+                )
+                _LOG.info(
+                    "h3_motion_context: keyframe %d requests pixel frame %d "
+                    "(inside latent step %d, frames %d-%d); the full %d-frame "
+                    "step will be pinned as a static hold. Nearest phase-0 "
+                    "positions (%s indexing): %d and %d",
+                    slot,
+                    pixel_index,
+                    step_k,
+                    step_start,
+                    step_start + step_span - 1,
+                    step_span,
+                    indexing,
+                    disp_lower,
+                    disp_upper,
+                )
+
+            image = kwargs.get("keyframe_image_%d" % slot)
+            if image is None:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d has no image connected"
+                    % slot
+                )
+            if getattr(image, "ndim", 0) != 4:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d expected IMAGE "
+                    "[B,H,W,C]" % slot
+                )
+            if int(image.shape[0]) != 1:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d must receive exactly "
+                    "one image, not a batch of %d"
+                    % (slot, int(image.shape[0]))
+                )
+
+            anchors.append((step_k, slot, image, pixel_index, step_start, step_span))
+
+        anchors.sort(key=lambda item: item[0])
+
+        for i in range(1, len(anchors)):
+            if anchors[i - 1][0] == anchors[i][0]:
+                slot_a, px_a = anchors[i - 1][1], anchors[i - 1][3]
+                slot_b, px_b = anchors[i][1], anchors[i][3]
+                disp_a = px_a + 1 if indexing == "1-based" else px_a
+                disp_b = px_b + 1 if indexing == "1-based" else px_b
+                raise ValueError(
+                    "h3_motion_context: keyframe %d (position %d) and "
+                    "keyframe %d (position %d) both map to latent step %d "
+                    "after quantization"
+                    % (slot_a, disp_a, slot_b, disp_b, anchors[i][0])
+                )
+
+        # Extract the audio stream from the AV latent.
+        parts = _streams_from_latent(latent)
+        target_video_tensor = parts[0]
+        if target_video_tensor.ndim == 4:
+            target_video_tensor = target_video_tensor.unsqueeze(0)
+        target_audio_tensor = parts[1] if len(parts) > 1 else None
+        if target_audio_tensor is not None and target_audio_tensor.ndim == 3:
+            target_audio_tensor = target_audio_tensor.unsqueeze(0)
+
+        out_video = target_video_tensor.clone()
+
+        existing_noise_mask = latent.get("noise_mask")
+        existing_video_mask = None
+        existing_audio_mask = None
+        if existing_noise_mask is not None:
+            if hasattr(existing_noise_mask, "unbind"):
+                mask_parts = list(existing_noise_mask.unbind())
+            elif isinstance(existing_noise_mask, (tuple, list)):
+                mask_parts = list(existing_noise_mask)
+            else:
+                raise ValueError(
+                    "h3_motion_context: H3 Custom Keyframes (Masked) can only merge "
+                    "a nested H3 AV noise_mask. The incoming mask is a single tensor; "
+                    "use H3 Set AV Noise Mask to create a two-stream H3 mask, or H3 "
+                    "Clear AV Noise Mask before applying hard keyframes."
+                )
+            if target_audio_tensor is not None and len(mask_parts) < 2:
+                raise ValueError(
+                    "h3_motion_context: H3 Custom Keyframes (Masked) requires both "
+                    "video and audio streams when merging an H3 AV noise_mask. Use "
+                    "H3 Set AV Noise Mask or H3 Clear AV Noise Mask first."
+                )
+            if mask_parts:
+                existing_video_mask = mask_parts[0]
+            if len(mask_parts) > 1:
+                existing_audio_mask = mask_parts[1]
+
+        expected_video_mask_shape = (
+            1, 1, latent_t, int(target_video_tensor.shape[3]), int(target_video_tensor.shape[4])
+        )
+        if existing_video_mask is not None:
+            if tuple(existing_video_mask.shape) != expected_video_mask_shape:
+                raise ValueError(
+                    "h3_motion_context: incoming H3 video noise-mask shape %s does "
+                    "not match target %s"
+                    % (tuple(existing_video_mask.shape), expected_video_mask_shape)
+                )
+            video_mask = existing_video_mask.to(
+                device=target_video_tensor.device, dtype=torch.float32
+            ).clone()
+        else:
+            video_mask = torch.ones(
+                expected_video_mask_shape,
+                device=target_video_tensor.device,
+                dtype=torch.float32,
+            )
+
+        if target_audio_tensor is not None:
+            expected_audio_mask_shape = (
+                1, 1, int(target_audio_tensor.shape[2]), int(target_audio_tensor.shape[3])
+            )
+            if existing_audio_mask is not None:
+                if tuple(existing_audio_mask.shape) != expected_audio_mask_shape:
+                    raise ValueError(
+                        "h3_motion_context: incoming H3 audio noise-mask shape %s does "
+                        "not match target %s"
+                        % (tuple(existing_audio_mask.shape), expected_audio_mask_shape)
+                    )
+                audio_mask = existing_audio_mask.to(
+                    device=target_audio_tensor.device, dtype=torch.float32
+                ).clone()
+            else:
+                audio_mask = torch.ones(
+                    expected_audio_mask_shape,
+                    device=target_audio_tensor.device,
+                    dtype=torch.float32,
+                )
+        else:
+            audio_mask = None
+
+        # Hard keyframes overwrite the latent value for their complete H3 video step.
+        # Refuse to overwrite any step that is already protected by an upstream mask;
+        # that would make two different preservation sources claim the same token.
+        for step_k, slot, image, pixel_index, step_start, step_span in anchors:
+            if bool((video_mask[:, :, step_k] < 1.0 - 1e-6).any()):
+                display_position = pixel_index + 1 if indexing == "1-based" else pixel_index
+                raise ValueError(
+                    "h3_motion_context: keyframe %d (position %d) maps to latent "
+                    "step %d, which is already protected by the incoming H3 video "
+                    "noise mask. Move the keyframe outside the protected insert/mask "
+                    "region or clear/change that mask first."
+                    % (slot, display_position, step_k)
+                )
+
+        for step_k, slot, image, pixel_index, step_start, step_span in anchors:
+            resized = _resize(image, width, height, crop)
+            encoded = vae.encode(resized)
+
+            if (
+                getattr(encoded, "ndim", 0) != 5
+                or int(encoded.shape[2]) != 1
+            ):
+                raise ValueError(
+                    "h3_motion_context: keyframe %d encoded to %s; "
+                    "expected one H3 still latent [B,C,1,H,W]"
+                    % (
+                        slot,
+                        tuple(getattr(encoded, "shape", ())),
+                    )
+                )
+
+            encoded = encoded[:1].to(device=out_video.device, dtype=out_video.dtype)
+            out_video[:, :, step_k : step_k + 1] = encoded
+            video_mask[:, :, step_k] = 0.0
+
+        out = latent.copy()
+        if target_audio_tensor is not None:
+            out["samples"] = comfy.nested_tensor.NestedTensor(
+                (out_video, target_audio_tensor.clone())
+            )
+            out["noise_mask"] = comfy.nested_tensor.NestedTensor(
+                (video_mask, audio_mask)
+            )
+        else:
+            out["samples"] = out_video
+            out["noise_mask"] = video_mask
+
+        pinned_steps = [a[0] for a in anchors]
+        _LOG.info(
+            "h3_motion_context: Custom Keyframes (Masked) pinned %d keyframes "
+            "at latent steps %s in a %d-frame %dx%d target",
+            len(anchors),
+            pinned_steps,
+            frame_count,
+            width,
+            height,
+        )
+        return (out,)
+
 
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContext": MiniMaxH3MotionContext,
@@ -1102,29 +1546,24 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContextSaveLatent": MiniMaxH3MotionContextSaveLatent,
     "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
     "MiniMaxH3CustomKeyframes": MiniMaxH3CustomKeyframes,
+    "MiniMaxH3CustomKeyframesMasked": MiniMaxH3CustomKeyframesMasked,
     "MiniMaxH3ExistingVideoMaskedContext": MiniMaxH3ExistingVideoMaskedContext,
     "MiniMaxH3GeneratedAVMaskedContext": MiniMaxH3GeneratedAVMaskedContext,
     "MiniMaxH3StartMaskedContext": MiniMaxH3StartMaskedContext,
-    "MiniMaxH3StartCheckpointMaskedContext": MiniMaxH3StartCheckpointMaskedContext,
     "MiniMaxH3MaskedAVBridge": MiniMaxH3MaskedAVBridge,
     "MiniMaxH3SongMaskedAVContext": MiniMaxH3SongMaskedAVContext,
-    "MiniMaxH3CheckpointSave": MiniMaxH3CheckpointSave,
-    "MiniMaxH3CheckpointSavePath": MiniMaxH3CheckpointSavePath,
-    "MiniMaxH3CheckpointLoadPath": MiniMaxH3CheckpointLoadPath,
-    "MiniMaxH3CheckpointTailFrames": MiniMaxH3CheckpointTailFrames,
-    "MiniMaxH3ResumeCheckpointLatent": MiniMaxH3ResumeCheckpointLatent,
-    "MiniMaxH3CheckpointLoad": MiniMaxH3CheckpointLoad,
-    "MiniMaxH3ResumeTailFrames": MiniMaxH3ResumeTailFrames,
-    "MiniMaxH3ResumeOrLiveLatent": MiniMaxH3ResumeOrLiveLatent,
-    "MiniMaxH3CheckpointTrigger": MiniMaxH3CheckpointTrigger,
-    "MiniMaxH3AssembleCheckpoints": MiniMaxH3AssembleCheckpoints,
-    "MiniMaxH3AssembleExtensionCheckpoints": MiniMaxH3AssembleExtensionCheckpoints,
-    "MiniMaxH3AssembleStarterOrExtensionCheckpoints": MiniMaxH3AssembleStarterOrExtensionCheckpoints,
-    "MiniMaxH3PreviewCheckpointVideo": MiniMaxH3PreviewCheckpointVideo,
     "MiniMaxH3AssembleExtension": MiniMaxH3AssembleExtension,
+    "MiniMaxH3StreamLiveExtensionAVToVHS": MiniMaxH3StreamLiveExtensionAVToVHS,
+    "MiniMaxH3StreamLiveMusicVideoToVHS": MiniMaxH3StreamLiveMusicVideoToVHS,
+    "MiniMaxH3FinalizeVHSOutput": MiniMaxH3FinalizeVHSOutput,
+    "MiniMaxH3AssembleInterior": MiniMaxH3AssembleInterior,
+    "MiniMaxH3SetAVNoiseMask": MiniMaxH3SetAVNoiseMask,
+    "MiniMaxH3ClearAVNoiseMask": MiniMaxH3ClearAVNoiseMask,
     "MiniMaxH3CropTo32": MiniMaxH3CropTo32,
     "MiniMaxH3StartCanvasSelector": MiniMaxH3StartCanvasSelector,
     "MiniMaxH3OptionalReferenceImage": MiniMaxH3OptionalReferenceImage,
+    "MiniMaxH3AVExtensionController": MiniMaxH3AVExtensionController,
+    "MiniMaxH3MusicVideoController": MiniMaxH3MusicVideoController,
     "MiniMaxH3ExtensionStartMode": MiniMaxH3ExtensionStartMode,
     "MiniMaxH3OptionalStartFrame": MiniMaxH3OptionalStartFrame,
 }
@@ -1134,28 +1573,24 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContextSaveLatent": "H3 Motion Context Save Latent",
     "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
     "MiniMaxH3CustomKeyframes": "H3 Custom Keyframes",
+    "MiniMaxH3CustomKeyframesMasked": "H3 Custom Keyframes (Masked)",
     "MiniMaxH3ExistingVideoMaskedContext": "H3 Existing Video Masked Context",
     "MiniMaxH3GeneratedAVMaskedContext": "H3 Generated AV Masked Context",
     "MiniMaxH3StartMaskedContext": "H3 Start Masked Context",
     "MiniMaxH3MaskedAVBridge": "H3 Masked AV Bridge",
     "MiniMaxH3SongMaskedAVContext": "H3 Song Audio + Masked Video Context",
-    "MiniMaxH3CheckpointSave": "H3 Checkpoint Save",
-    "MiniMaxH3CheckpointSavePath": "H3 Persistent Checkpoint Gate",
-    "MiniMaxH3CheckpointLoadPath": "H3 Checkpoint Load Path",
-    "MiniMaxH3CheckpointTailFrames": "H3 Checkpoint Tail Frames",
-    "MiniMaxH3ResumeCheckpointLatent": "H3 Resume / Saved AV Latent",
-    "MiniMaxH3CheckpointLoad": "H3 Checkpoint Load",
-    "MiniMaxH3ResumeTailFrames": "H3 Resume / Live Tail Frames",
-    "MiniMaxH3ResumeOrLiveLatent": "H3 Resume / Live AV Latent",
-    "MiniMaxH3CheckpointTrigger": "H3 Checkpoint Final Trigger",
-    "MiniMaxH3AssembleCheckpoints": "H3 Assemble Checkpoints",
-    "MiniMaxH3AssembleExtensionCheckpoints": "H3 Assemble Extension Checkpoints",
-    "MiniMaxH3AssembleStarterOrExtensionCheckpoints": "H3 Assemble Starter + Extension Checkpoints",
-    "MiniMaxH3PreviewCheckpointVideo": "H3 Preview Checkpoint Video",
     "MiniMaxH3AssembleExtension": "H3 Assemble Existing Video Extension",
+    "MiniMaxH3StreamLiveExtensionAVToVHS": "H3 Stream Final AV Extension to VHS",
+    "MiniMaxH3StreamLiveMusicVideoToVHS": "H3 Stream Final Music Video to VHS",
+    "MiniMaxH3FinalizeVHSOutput": "H3 Final Stream Output Sink",
+    "MiniMaxH3AssembleInterior": "H3 Assemble Interior Insert",
+    "MiniMaxH3SetAVNoiseMask": "H3 Set AV Noise Mask",
+    "MiniMaxH3ClearAVNoiseMask": "H3 Clear AV Noise Mask",
     "MiniMaxH3CropTo32": "H3 Crop Source To /32",
     "MiniMaxH3StartCanvasSelector": "H3 Start Canvas Selector",
     "MiniMaxH3OptionalReferenceImage": "H3 Optional Reference Image",
+    "MiniMaxH3AVExtensionController": "H3 AV Extension Controller",
+    "MiniMaxH3MusicVideoController": "H3 Music Video Controller",
     "MiniMaxH3ExtensionStartMode": "H3 Extension Start Mode",
     "MiniMaxH3OptionalStartFrame": "H3 Optional Starter First Frame",
 }
